@@ -572,7 +572,7 @@ impl Vmm {
         self.restore_activate_devices(&checkpoint.devices)
             .map_err(Error::Snapshot)?;
         self.restore_vcpu_states(checkpoint.vcpu_states)?;
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         self.mmio_device_manager.replay_restored_interrupts();
         Ok(())
     }
