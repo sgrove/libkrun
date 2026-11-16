@@ -145,7 +145,10 @@ impl Vm {
                 Vec::new()
             }
         };
-        Ok(VmState { gic_distributor })
+        Ok(VmState {
+            gic_distributor,
+            captured_unix_ns: unix_now_ns(),
+        })
     }
 
     /// Restore VM-level state: replay the GIC distributor registers onto the
@@ -724,6 +727,21 @@ pub struct VmState {
     /// In-kernel HVF GIC distributor registers as (reg-offset, value) pairs
     /// (see [`Vm::save_state`]). Empty when there is no in-kernel GIC.
     pub gic_distributor: Vec<(u32, u64)>,
+    /// Host wall-clock time of the capture, nanoseconds since the Unix epoch;
+    /// 0 when the blob predates the field. A restore uses it to hide the time
+    /// between capture and restore from the guest's virtual counter (see
+    /// [`VmState::elapsed_since_capture`]).
+    pub captured_unix_ns: u64,
+}
+
+/// Host wall-clock time, nanoseconds since the Unix epoch (0 before it).
+#[cfg(target_arch = "aarch64")]
+pub fn unix_now_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)
+        })
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -732,13 +750,37 @@ impl VmState {
     /// byte blob (mirrors the KVM `VmState::serialize` signature so the
     /// cross-platform [`crate::VmCheckpoint`] can call it uniformly).
     pub fn serialize(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(4 + self.gic_distributor.len() * 12);
+        let mut out = Vec::with_capacity(4 + self.gic_distributor.len() * 12 + 8);
         out.extend_from_slice(&(self.gic_distributor.len() as u32).to_le_bytes());
         for &(reg, val) in &self.gic_distributor {
             out.extend_from_slice(&reg.to_le_bytes());
             out.extend_from_slice(&val.to_le_bytes());
         }
+        out.extend_from_slice(&self.captured_unix_ns.to_le_bytes());
         out
+    }
+
+    /// How long ago this state was captured, as of `now_unix_ns`: the time a
+    /// restored guest must not see pass on its virtual counter.
+    ///
+    /// The counter offset in each vCPU's state is absolute against the host
+    /// counter, which kept running after the capture. Restored as it is, the
+    /// guest's counter, and with it `CLOCK_MONOTONIC` and jiffies, leaps by
+    /// the snapshot's whole age in one step: the kernel's stall detectors
+    /// read that as a stall (an RCU stall report waits up to 10 s for every
+    /// CPU that does not answer its backtrace request) and every timer due in
+    /// the interval fires at once. Resuming with this duration as the paused
+    /// time moves the offset by it, exactly as an in-place pause does, so the
+    /// counter continues from its captured value. Wall-clock time is not the
+    /// counter's business: the time-sync device sets it after the restore.
+    ///
+    /// Zero when the capture time is unknown (an older blob) or lies in the
+    /// future (the host clock was set back): the offset is then left alone.
+    pub fn elapsed_since_capture(&self, now_unix_ns: u64) -> Duration {
+        if self.captured_unix_ns == 0 {
+            return Duration::ZERO;
+        }
+        Duration::from_nanos(now_unix_ns.saturating_sub(self.captured_unix_ns))
     }
 
     /// Reconstruct from a blob produced by [`Self::serialize`].
@@ -764,7 +806,16 @@ impl VmState {
             let val = u64::from_le_bytes(take(bytes, &mut pos, 8)?.try_into().map_err(|_| err())?);
             gic_distributor.push((reg, val));
         }
-        Ok(VmState { gic_distributor })
+        // Appended after the registers; absent in a blob that predates it.
+        let captured_unix_ns = if bytes.len() - pos >= 8 {
+            u64::from_le_bytes(take(bytes, &mut pos, 8)?.try_into().map_err(|_| err())?)
+        } else {
+            0
+        };
+        Ok(VmState {
+            gic_distributor,
+            captured_unix_ns,
+        })
     }
 }
 
@@ -868,6 +919,44 @@ mod tests {
     use arch::aarch64::layout::DRAM_MEM_START_EFI;
     use devices::legacy::VcpuList;
     use vm_memory::{GuestAddress, GuestMemoryMmap};
+
+    // A restore hides exactly the time since the capture from the guest's
+    // counter; an unknown or future capture time hides nothing.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn a_restore_hides_the_time_since_capture() {
+        let state = VmState {
+            gic_distributor: vec![(0x80, 7)],
+            captured_unix_ns: 1_000,
+        };
+        assert_eq!(
+            state.elapsed_since_capture(1_000 + 8_030_000_000_000),
+            Duration::from_secs(8_030)
+        );
+        assert_eq!(state.elapsed_since_capture(1_000), Duration::ZERO);
+        assert_eq!(state.elapsed_since_capture(999), Duration::ZERO);
+        let unknown = VmState::default();
+        assert_eq!(unknown.elapsed_since_capture(u64::MAX), Duration::ZERO);
+    }
+
+    // The capture time survives the blob, and a blob written before the field
+    // existed still decodes, with the capture time unknown.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn the_capture_time_round_trips_and_an_older_blob_decodes() {
+        let state = VmState {
+            gic_distributor: vec![(0x80, 7), (0x84, 9)],
+            captured_unix_ns: 1_794_000_000_000_000_000,
+        };
+        let blob = state.serialize();
+        let decoded = VmState::deserialize(&blob).unwrap();
+        assert_eq!(decoded.gic_distributor, state.gic_distributor);
+        assert_eq!(decoded.captured_unix_ns, state.captured_unix_ns);
+        let older = &blob[..blob.len() - 8];
+        let decoded = VmState::deserialize(older).unwrap();
+        assert_eq!(decoded.gic_distributor, state.gic_distributor);
+        assert_eq!(decoded.captured_unix_ns, 0);
+    }
 
     // Auxiliary function being used throughout the tests.
     // Does NOT create a real HVF VM — Vcpu::new_aarch64 and most vcpu methods
