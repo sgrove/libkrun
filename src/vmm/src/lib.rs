@@ -569,6 +569,19 @@ impl Vmm {
         if let Some(bytes) = &checkpoint.ioapic {
             self.intc.lock().unwrap().restore_state(bytes);
         }
+        // The guest was "paused" from the capture until now: the resume that
+        // follows moves each vCPU's counter offset by that long, so the
+        // guest's virtual counter continues from its captured value instead
+        // of leaping by the snapshot's age.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            let elapsed = checkpoint
+                .vm_state
+                .elapsed_since_capture(vstate::unix_now_ns());
+            if let Some(paused_at) = Instant::now().checked_sub(elapsed) {
+                self.paused_at = Some(paused_at);
+            }
+        }
         self.restore_activate_devices(&checkpoint.devices)
             .map_err(Error::Snapshot)?;
         self.restore_vcpu_states(checkpoint.vcpu_states)?;
